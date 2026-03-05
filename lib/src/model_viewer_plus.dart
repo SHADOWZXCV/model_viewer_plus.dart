@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
+import 'model_viewer_controller.dart';
+
 import 'model_viewer_plus_stub.dart'
     if (dart.library.io) 'model_viewer_plus_io.dart'
     if (dart.library.js_interop) 'model_viewer_plus_web.dart';
@@ -88,6 +90,7 @@ class ModelViewer extends StatefulWidget {
     this.debugLogging = true,
     this.javascriptChannels,
     this.onWebViewCreated,
+    this.controller,
     super.key,
   });
 
@@ -579,6 +582,13 @@ class ModelViewer extends StatefulWidget {
   ///
   /// Called *after* the logic that initializes the model-viewer.
   final ValueChanged<WebViewController>? onWebViewCreated;
+
+  /// A [ModelViewerController] that enables programmatic control of the viewer
+  /// (play animations, toggle material view, set blend time, etc.).
+  ///
+  /// Only supported on Windows (Three.js renderer).  On other platforms this
+  /// field is ignored.
+  final ModelViewerController? controller;
 
   @override
   State<ModelViewer> createState() => ModelViewerState();

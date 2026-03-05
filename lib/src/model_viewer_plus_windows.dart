@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:convert' show utf8;
+import 'dart:convert' show json, utf8;
 import 'dart:io'
     show File, HttpResponse, HttpServer, HttpStatus, InternetAddress;
 
@@ -9,7 +9,6 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:path/path.dart' as p;
 
-import 'html_builder.dart';
 import 'model_viewer_plus.dart';
 import 'model_viewer_plus_io.dart';
 
@@ -52,9 +51,14 @@ class ModelViewerWindowsState extends State<WindowsModelViewer> {
         disableContextMenu: true,
         supportZoom: false,
         javaScriptEnabled: true,
+        allowFileAccessFromFileURLs: true,
+        allowUniversalAccessFromFileURLs: true,
       ),
       onWebViewCreated: (controller) {
-        // Add JavaScript channels if provided
+        // Attach the native controller so ModelViewerController.evaluateJavascript works
+        modelWidget.controller?.attach(controller);
+
+        // Register JavaScript channels if provided
         if (modelWidget.javascriptChannels != null) {
           for (final channel in modelWidget.javascriptChannels!) {
             controller.addJavaScriptHandler(
@@ -67,82 +71,128 @@ class ModelViewerWindowsState extends State<WindowsModelViewer> {
           }
         }
 
-        debugPrint('ModelViewer initializing... <$_proxyURL>');
+        // onWebViewCreated expects a webview_flutter WebViewController.
+        // InAppWebView uses a different controller type on Windows; callers
+        // should use javascriptChannels or ModelViewerController instead.
+        if (modelWidget.onWebViewCreated != null) {
+          debugPrint(
+            'ModelViewer (Windows/Three.js): onWebViewCreated is not '
+            'supported on this platform. Use javascriptChannels or '
+            'ModelViewerController instead.',
+          );
+        }
+
+        if (modelWidget.debugLogging) {
+          debugPrint('ModelViewer (Three.js) initializing… <$_proxyURL>');
+        }
       },
       onLoadStop: (controller, url) {
-        debugPrint('ModelViewer loaded: $url');
+        if (modelWidget.debugLogging) {
+          debugPrint('ModelViewer (Three.js) loaded: $url');
+        }
       },
       onConsoleMessage: (controller, consoleMessage) {
         if (modelWidget.debugLogging) {
-          debugPrint('Console: ${consoleMessage.message}');
+          debugPrint('[Three.js] ${consoleMessage.message}');
         }
       },
     );
   }
 
-  String _buildHTML(String htmlTemplate) {
-    String src;
-    if (modelWidget.src.startsWith('data:')) {
-      src = modelWidget.src;
-    } else {
-      src = '/model';
+  // ── CONFIG INJECTION ─────────────────────────────────────────────────────────
+  // Builds the window.MVConfig JSON object read by the Three.js template.
+  String _buildConfigScript() {
+    final mw = modelWidget;
+
+    // Convert Flutter Color → CSS hex string
+    String colorToCss(Color c) {
+      if (c == Colors.transparent) return 'transparent';
+      final argb = c.value;
+      final r = (argb >> 16) & 0xFF;
+      final g = (argb >> 8) & 0xFF;
+      final b = argb & 0xFF;
+      return '#${r.toRadixString(16).padLeft(2, '0')}'
+          '${g.toRadixString(16).padLeft(2, '0')}'
+          '${b.toRadixString(16).padLeft(2, '0')}';
     }
-    return HTMLBuilder.build(
-      htmlTemplate: htmlTemplate,
-      src: src,
-      alt: modelWidget.alt,
-      poster: modelWidget.poster,
-      loading: modelWidget.loading,
-      reveal: modelWidget.reveal,
-      withCredentials: modelWidget.withCredentials,
-      ar: modelWidget.ar,
-      arModes: modelWidget.arModes,
-      arScale: modelWidget.arScale,
-      arPlacement: modelWidget.arPlacement,
-      iosSrc: modelWidget.iosSrc,
-      xrEnvironment: modelWidget.xrEnvironment,
-      cameraControls: modelWidget.cameraControls,
-      disablePan: modelWidget.disablePan,
-      disableTap: modelWidget.disableTap,
-      touchAction: modelWidget.touchAction,
-      disableZoom: modelWidget.disableZoom,
-      orbitSensitivity: modelWidget.orbitSensitivity,
-      autoRotate: modelWidget.autoRotate,
-      autoRotateDelay: modelWidget.autoRotateDelay,
-      rotationPerSecond: modelWidget.rotationPerSecond,
-      interactionPrompt: modelWidget.interactionPrompt,
-      interactionPromptStyle: modelWidget.interactionPromptStyle,
-      interactionPromptThreshold: modelWidget.interactionPromptThreshold,
-      cameraOrbit: modelWidget.cameraOrbit,
-      cameraTarget: modelWidget.cameraTarget,
-      fieldOfView: modelWidget.fieldOfView,
-      maxCameraOrbit: modelWidget.maxCameraOrbit,
-      minCameraOrbit: modelWidget.minCameraOrbit,
-      maxFieldOfView: modelWidget.maxFieldOfView,
-      minFieldOfView: modelWidget.minFieldOfView,
-      interpolationDecay: modelWidget.interpolationDecay,
-      skyboxImage: modelWidget.skyboxImage,
-      environmentImage: modelWidget.environmentImage,
-      exposure: modelWidget.exposure,
-      shadowIntensity: modelWidget.shadowIntensity,
-      shadowSoftness: modelWidget.shadowSoftness,
-      animationName: modelWidget.animationName,
-      animationCrossfadeDuration: modelWidget.animationCrossfadeDuration,
-      autoPlay: modelWidget.autoPlay,
-      variantName: modelWidget.variantName,
-      orientation: modelWidget.orientation,
-      scale: modelWidget.scale,
-      backgroundColor: modelWidget.backgroundColor,
-      minHotspotOpacity: modelWidget.minHotspotOpacity,
-      maxHotspotOpacity: modelWidget.maxHotspotOpacity,
-      innerModelViewerHtml: modelWidget.innerModelViewerHtml,
-      relatedCss: modelWidget.relatedCss,
-      relatedJs: modelWidget.relatedJs,
-      id: modelWidget.id,
-      debugLogging: modelWidget.debugLogging,
-    );
+
+    final Map<String, dynamic> config = {
+      // Camera
+      'cameraControls': mw.cameraControls ?? true,
+      'disablePan': mw.disablePan ?? false,
+      'disableTap': mw.disableTap ?? false,
+      'disableZoom': mw.disableZoom ?? false,
+      if (mw.orbitSensitivity != null) 'orbitSensitivity': mw.orbitSensitivity,
+      if (mw.fieldOfView != null) 'fieldOfView': mw.fieldOfView,
+      if (mw.cameraOrbit != null) 'cameraOrbit': mw.cameraOrbit,
+      if (mw.cameraTarget != null) 'cameraTarget': mw.cameraTarget,
+      if (mw.maxCameraOrbit != null) 'maxCameraOrbit': mw.maxCameraOrbit,
+      if (mw.minCameraOrbit != null) 'minCameraOrbit': mw.minCameraOrbit,
+      if (mw.maxFieldOfView != null) 'maxFieldOfView': mw.maxFieldOfView,
+      if (mw.minFieldOfView != null) 'minFieldOfView': mw.minFieldOfView,
+      if (mw.interpolationDecay != null)
+        'interpolationDecay': mw.interpolationDecay,
+
+      // Auto-rotate
+      'autoRotate': mw.autoRotate ?? false,
+      if (mw.autoRotateDelay != null) 'autoRotateDelay': mw.autoRotateDelay,
+      if (mw.rotationPerSecond != null)
+        'rotationPerSecond': mw.rotationPerSecond,
+
+      // Lighting & environment
+      if (mw.exposure != null) 'exposure': mw.exposure,
+      if (mw.shadowIntensity != null) 'shadowIntensity': mw.shadowIntensity,
+      if (mw.shadowSoftness != null) 'shadowSoftness': mw.shadowSoftness,
+      if (mw.environmentImage != null) 'environmentImage': mw.environmentImage,
+      if (mw.skyboxImage != null) 'skyboxImage': mw.skyboxImage,
+
+      // Display
+      'backgroundColor': colorToCss(mw.backgroundColor),
+      'debugLogging': mw.debugLogging,
+
+      // Animation
+      if (mw.animationName != null) 'animationName': mw.animationName,
+      if (mw.animationCrossfadeDuration != null)
+        'animationCrossfadeDuration': mw.animationCrossfadeDuration,
+      'autoPlay': mw.autoPlay ?? false,
+
+      // Scene graph
+      if (mw.orientation != null) 'orientation': mw.orientation,
+      if (mw.scale != null) 'scale': mw.scale,
+
+      // Custom JS (evaluated after model loads)
+      if (mw.relatedJs != null) 'relatedJs': mw.relatedJs,
+
+      // Names of Dart-registered JS channels — JS uses this to guard callHandler
+      // calls and avoid crashing when no handler is registered on the Dart side.
+      'jsChannels':
+          mw.javascriptChannels?.map((c) => c.name).toList() ?? <String>[],
+    };
+
+    return 'window.MVConfig = ${json.encode(config)};';
   }
 
+  // ── HTML ASSEMBLY ─────────────────────────────────────────────────────────────
+  // Injects config script (and optional relatedCss) into the template.
+  String _assembleHTML(String template) {
+    var html = template;
+
+    // Inject relatedCss into the placeholder inside the <style> block
+    if (modelWidget.relatedCss != null) {
+      html = html.replaceFirst(
+        '  /* related-css */',
+        '  /* related-css */\n  ${modelWidget.relatedCss}',
+      );
+    }
+
+    // Inject config script just before </head>
+    final configScript = '<script>\n${_buildConfigScript()}\n</script>\n';
+    html = html.replaceFirst('</head>', '$configScript</head>');
+
+    return html;
+  }
+
+  // ── PROXY ─────────────────────────────────────────────────────────────────────
   Future<void> _initProxy() async {
     _proxy = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
 
@@ -151,50 +201,46 @@ class ModelViewerWindowsState extends State<WindowsModelViewer> {
     _proxyURL = 'http://$host:$port/';
 
     _proxy!.listen((request) async {
-      final Uri url = Uri.parse(modelWidget.src);
+      final Uri modelUri = Uri.parse(modelWidget.src);
       final HttpResponse response = request.response;
+
+      // CORS header on every response
+      response.headers.add('Access-Control-Allow-Origin', '*');
 
       switch (request.uri.path) {
         case '/':
         case '/index.html':
-          final String htmlTemplate = await rootBundle.loadString(
-            'packages/model_viewer_plus/assets/template.html',
+          final String template = await rootBundle.loadString(
+            'packages/model_viewer_plus/assets/threejs_windows_template.html',
           );
-          final Uint8List html = utf8.encode(_buildHTML(htmlTemplate));
+          final Uint8List html = utf8.encode(_assembleHTML(template));
           response
             ..statusCode = HttpStatus.ok
             ..headers.add('Content-Type', 'text/html;charset=UTF-8')
             ..headers.add('Content-Length', html.length.toString())
             ..add(html);
           await response.close();
-        case '/model-viewer.min.js':
-          final Uint8List code = await _readAsset(
-            'packages/model_viewer_plus/assets/model-viewer.min.js',
-          );
-          response
-            ..statusCode = HttpStatus.ok
-            ..headers.add(
-              'Content-Type',
-              'application/javascript;charset=UTF-8',
-            )
-            ..headers.add('Content-Length', code.lengthInBytes.toString())
-            ..add(code);
-          await response.close();
+
         case '/model':
-          if (url.isAbsolute && !url.isScheme('file')) {
-            await response.redirect(url);
+          if (modelWidget.src.startsWith('data:')) {
+            // Data-URI models are embedded in window.MVConfig.src directly;
+            // the /model route is unused in that case.
+            response.statusCode = HttpStatus.noContent;
+            await response.close();
+          } else if (modelUri.isAbsolute && !modelUri.isScheme('file')) {
+            await response.redirect(modelUri);
           } else {
-            final Uint8List data = await (url.isScheme('file')
-                ? _readFile(url.path)
-                : _readAsset(url.path));
+            final Uint8List data = await (modelUri.isScheme('file')
+                ? _readFile(modelUri.path)
+                : _readAsset(modelUri.path));
             response
               ..statusCode = HttpStatus.ok
               ..headers.add('Content-Type', 'application/octet-stream')
               ..headers.add('Content-Length', data.lengthInBytes.toString())
-              ..headers.add('Access-Control-Allow-Origin', '*')
               ..add(data);
             await response.close();
           }
+
         case '/favicon.ico':
           final Uint8List text = utf8.encode(
             "Resource '${request.uri}' not found",
@@ -205,22 +251,28 @@ class ModelViewerWindowsState extends State<WindowsModelViewer> {
             ..headers.add('Content-Length', text.length.toString())
             ..add(text);
           await response.close();
+
         default:
+          // Redirect absolute URIs directly (CDN imports, env maps, etc.)
           if (request.uri.isAbsolute) {
             debugPrint('Redirect: ${request.uri}');
             await response.redirect(request.uri);
           } else if (request.uri.hasAbsolutePath) {
-            final List<String> pathSegments = [...url.pathSegments]
+            // Resolve relative to model source directory
+            final List<String> pathSegments = [...modelUri.pathSegments]
               ..removeLast();
+            final String origin = modelUri.isAbsolute
+                ? modelUri.origin
+                : 'http://$host:$port';
             final String tryDestination = p.joinAll([
-              url.origin,
+              origin,
               ...pathSegments,
               request.uri.path.replaceFirst('/', ''),
             ]);
             debugPrint('Try: $tryDestination');
             await response.redirect(Uri.parse(tryDestination));
           } else {
-            debugPrint('404 with ${request.uri}');
+            debugPrint('404: ${request.uri}');
             final Uint8List text = utf8.encode(
               "Resource '${request.uri}' not found",
             );

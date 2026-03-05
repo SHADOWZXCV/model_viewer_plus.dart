@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model Viewer</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; font-family: monospace; color: #eee; }
+  canvas { display: block; width: 100% !important; height: 100% !important; }
+
+  #loading {
+    position: fixed; inset: 0; display: flex;
+    align-items: center; justify-content: center; flex-direction: column; z-index: 50; gap: 14px;
+    background: rgba(0,0,0,0.6);
+  }
+  #loading p { color: #7df; font-size: 14px; }
+  .spinner {
+    width: 40px; height: 40px; border: 3px solid #334; border-top-color: #7df;
+    border-radius: 50%; animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* related-css */
+</style>
+</head>
+<body>
+
+<div id="loading"><div class="spinner"></div><p id="loading-text">Loading model…</p></div>
+
+<!-- ── EARLY ERROR SURFACE ── catch anything before the module boots ─────── -->
+<script>
+  window.onerror = function(msg, src, line, col, err) {
+    console.error('[MV onerror]', msg, '@ ' + src + ':' + line + ':' + col, err);
+  };
+  window.addEventListener('unhandledrejection', function(e) {
+    console.error('[MV unhandledrejection]', e.reason);
+  });
+</script>
+
+<script type="importmap">
+{
+  "imports": {
+    "three":                "https://unpkg.com/three@0.159.0/build/three.module.js",
+    "three/addons/":        "https://unpkg.com/three@0.159.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE        from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader }    from 'three/addons/loaders/GLTFLoader.js';
+import { RGBELoader }    from 'three/addons/loaders/RGBELoader.js';
+
+// ── CONFIG (injected by Flutter) ──────────────────────────────────────────────
+const CFG = window.MVConfig || {};
+const dbg = CFG.debugLogging !== false;
+function log(...a) { if (dbg) console.log(...a); }
+
+// ── RENDERER ─────────────────────────────────────────────────────────────────
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'default' });
+// Cap pixel ratio at 2 to avoid memory pressure on high-DPI displays
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+// Only enable shadow maps when the caller actually wants shadows
+const _shadowIntensity = CFG.shadowIntensity != null ? parseFloat(CFG.shadowIntensity) : 0;
+renderer.shadowMap.enabled = _shadowIntensity > 0;
+renderer.shadowMap.type    = THREE.PCFShadowMap;   // PCFSoft is heavier; use basic PCF
+renderer.toneMapping       = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = CFG.exposure != null ? parseFloat(CFG.exposure) : 1.0;
+renderer.outputColorSpace  = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+// ── WEBGL CONTEXT LOSS HANDLER ────────────────────────────────────────────────
+renderer.domElement.addEventListener('webglcontextlost', (e) => {
+  e.preventDefault();
+  console.error('[MV] WebGL context lost — rendering paused.');
+  notifyChannel('onError', 'WebGL context lost');
+}, false);
+renderer.domElement.addEventListener('webglcontextrestored', () => {
+  console.log('[MV] WebGL context restored.');
+}, false);
+
+// ── SCENE ─────────────────────────────────────────────────────────────────────
+const scene = new THREE.Scene();
+
+// Background colour
+(function applyBackground() {
+  const raw = CFG.backgroundColor || 'transparent';
+  if (raw === 'transparent' || raw === '') {
+    renderer.setClearColor(0x000000, 0);
+    scene.background = null;
+  } else {
+    try {
+      const c = new THREE.Color(raw);
+      scene.background = c;
+      renderer.setClearColor(c, 1);
+    } catch(e) {
+      renderer.setClearColor(0x000000, 0);
+      scene.background = null;
+    }
+  }
+})();
+
+// Lights
+const hemi = new THREE.HemisphereLight(0x8899ff, 0x443322, 1.2);
+scene.add(hemi);
+const key  = new THREE.DirectionalLight(0xffffff, 2.0);
+key.position.set(4, 8, 4);
+key.castShadow = false; // set properly after _shadowIntensity is evaluated below
+if (_shadowIntensity > 0) {
+  key.shadow.mapSize.set(1024, 1024); // 1024 is safe; 2048 can OOM on some GPUs
+  key.shadow.camera.near = 0.1;
+  key.shadow.camera.far  = 200;
+}
+scene.add(key);
+const fill = new THREE.DirectionalLight(0xffffff, 0.5);
+fill.position.set(-4, 2, -4);
+scene.add(fill);
+
+// Shadow plane — only created when shadows are actually enabled
+const shadowPlaneGeo = new THREE.PlaneGeometry(40, 40);
+const shadowPlaneMat = _shadowIntensity > 0
+  ? new THREE.ShadowMaterial({ opacity: _shadowIntensity })
+  : new THREE.MeshBasicMaterial({ visible: false });
+const shadowPlane = new THREE.Mesh(shadowPlaneGeo, shadowPlaneMat);
+shadowPlane.rotation.x = -Math.PI / 2;
+shadowPlane.receiveShadow = _shadowIntensity > 0;
+scene.add(shadowPlane);
+
+// Only cast shadows from the key light when shadow maps are enabled
+key.castShadow = _shadowIntensity > 0;
+
+// Optional grid
+const grid = new THREE.GridHelper(20, 20, 0x222244, 0x1a1a33);
+grid.visible = false; // hidden by default; can enable via relatedJs
+scene.add(grid);
+window.MVGrid = grid; // expose for relatedJs
+
+// ── MATERIAL VIEW ──────────────────────────────────────────────────────────────────
+// Stores original PBR materials so they can be restored after material-view
+// mode is toggled off.  MeshBasicMaterial shows textures/vertex-colours
+// without any lighting calculation (“no lighting” mode).
+const _origMaterials = new Map();
+let   _materialViewActive = CFG.materialView === true;
+
+function setMaterialView(enabled) {
+  _materialViewActive = enabled;
+  scene.traverse(o => {
+    // Skip non-meshes and internal scene helpers so they keep their own materials.
+    if (!o.isMesh || o === shadowPlane || o === grid) return;
+    if (enabled) {
+      // Store original material(s) the first time
+      if (!_origMaterials.has(o.uuid)) {
+        _origMaterials.set(o.uuid, Array.isArray(o.material)
+          ? [...o.material] : o.material);
+      }
+      const orig = _origMaterials.get(o.uuid);
+      const mats = Array.isArray(orig) ? orig : [orig];
+      const basics = mats.map(m => {
+        const b = new THREE.MeshBasicMaterial();
+        if (m.map)       b.map        = m.map;
+        if (m.color)     b.color.copy(m.color);
+        b.vertexColors = m.vertexColors || false;
+        b.transparent  = m.transparent  || false;
+        b.opacity      = m.opacity  != null ? m.opacity  : 1.0;
+        b.side         = m.side     != null ? m.side     : THREE.FrontSide;
+        if (m.alphaMap)  b.alphaMap  = m.alphaMap;
+        return b;
+      });
+      o.material = Array.isArray(orig) ? basics : basics[0];
+    } else {
+      const orig = _origMaterials.get(o.uuid);
+      if (orig != null) o.material = orig;
+    }
+  });
+}
+
+// Environment / skybox
+if (CFG.skyboxImage || CFG.environmentImage) {
+  const envSrc = CFG.skyboxImage || CFG.environmentImage;
+  if (envSrc.match(/\.(hdr|exr)$/i)) {
+    new RGBELoader().load(envSrc, (texture) => {
+      texture.mapping = THREE.EquirectangularReflectionMapping;
+      if (CFG.skyboxImage) scene.background = texture;
+      scene.environment = texture;
+    });
+  } else {
+    new THREE.TextureLoader().load(envSrc, (texture) => {
+      texture.mapping = THREE.EquirectangularReflectionMapping;
+      if (CFG.skyboxImage) scene.background = texture;
+      scene.environment = texture;
+    });
+  }
+}
+
+// ── CAMERA ───────────────────────────────────────────────────────────────────
+const fovDeg = parseDegree(CFG.fieldOfView, 45);
+const camera = new THREE.PerspectiveCamera(fovDeg, innerWidth / innerHeight, 0.001, 10000);
+camera.position.set(0, 1.5, 4);
+
+// ── ORBIT CONTROLS ───────────────────────────────────────────────────────────
+const orbit = new OrbitControls(camera, renderer.domElement);
+orbit.target.set(0, 1, 0);
+orbit.enablePan   = !(CFG.disablePan   === true || CFG.disablePan   === 'true');
+orbit.enableZoom  = !(CFG.disableZoom  === true || CFG.disableZoom  === 'true');
+orbit.enabled     = (CFG.cameraControls !== false && CFG.cameraControls !== 'false');
+if (CFG.orbitSensitivity != null) {
+  const s = parseFloat(CFG.orbitSensitivity);
+  orbit.rotateSpeed = s; orbit.panSpeed = s; orbit.zoomSpeed = s;
+}
+orbit.update();
+
+// ── HELPERS ──────────────────────────────────────────────────────────────────
+function parseDegree(val, def) {
+  if (val == null) return def;
+  const s = String(val).trim();
+  if (s.endsWith('rad')) return THREE.MathUtils.radToDeg(parseFloat(s));
+  if (s.endsWith('deg')) return parseFloat(s);
+  const n = parseFloat(s);
+  return isNaN(n) ? def : n;
+}
+
+// ── STATE ────────────────────────────────────────────────────────────────────
+let mixer        = null;
+let allActions   = {};
+let activeAction = null;
+let fromAction   = null;
+let currentName  = '';
+let idleName     = '';
+let afterMode    = 'idle';
+let blendDur     = CFG.animationCrossfadeDuration != null
+                     ? parseFloat(CFG.animationCrossfadeDuration) / 1000
+                     : 0.3;
+let blendElapsed = 0;
+let isBlending   = false;
+let returningToIdle = false;
+
+let autoRotating   = CFG.autoRotate === true || CFG.autoRotate === 'true';
+let autoRotateTimer = 0;
+const autoRotateDelaySec = CFG.autoRotateDelay != null
+  ? parseFloat(CFG.autoRotateDelay) / 1000
+  : 3.0;
+let autoRotateSpeed = 0.5; // radians/sec default
+if (CFG.rotationPerSecond) {
+  const s = String(CFG.rotationPerSecond).trim();
+  if (s.endsWith('deg')) autoRotateSpeed = THREE.MathUtils.degToRad(parseFloat(s));
+  else if (s.endsWith('rad')) autoRotateSpeed = parseFloat(s);
+  else autoRotateSpeed = parseFloat(s) || 0.5;
+}
+
+let userInteracting = false;
+let userInteractTimer = 0;
+
+const clock = new THREE.Clock();
+const loadingEl  = document.getElementById('loading');
+const loadingTxt = document.getElementById('loading-text');
+
+function easeInOut(t) { return t < 0.5 ? 2*t*t : -1+(4-2*t)*t; }
+
+window.setMode = function(m) { afterMode = m; };
+setMode('idle');
+
+function activateAction(action, loop) {
+  action.reset();
+  action.enabled = true;
+  action.setEffectiveTimeScale(1);
+  action.setEffectiveWeight(0);
+  if (loop) {
+    action.setLoop(THREE.LoopRepeat, Infinity);
+    action.clampWhenFinished = false;
+  } else {
+    action.setLoop(THREE.LoopOnce, 1);
+    action.clampWhenFinished = true;
+  }
+  action.play();
+}
+
+// ── FADE TO ACTION ────────────────────────────────────────────────────────────
+window.fadeToAction = function fadeToAction(name) {
+  const next = allActions[name];
+  if (!next) { log('fadeToAction: unknown clip', name); return; }
+  if (name === currentName && !isBlending) return;
+
+  if (isBlending && fromAction) {
+    fromAction.setEffectiveWeight(0);
+    fromAction.enabled = false;
+  }
+
+  fromAction      = activeAction;
+  activeAction    = next;
+  currentName     = name;
+  returningToIdle = (name === idleName);
+
+  activateAction(next, (name === idleName) || afterMode === 'loop');
+
+  if (fromAction) {
+    fromAction.enabled = true;
+    fromAction.paused  = false;
+    fromAction.setEffectiveWeight(1);
+  }
+
+  blendElapsed = 0;
+  isBlending   = true;
+
+  notifyChannel('onAnimationChange', name);
+};
+
+// ── FLUTTER CHANNEL BRIDGE ────────────────────────────────────────────────────
+// Only call flutter_inappwebview.callHandler for channels the Dart side has
+// explicitly registered via javascriptChannels.  Calling it for an unregistered
+// channel causes flutter_inappwebview on Windows to throw an unhandled Dart
+// exception and kill the entire app process.
+const _registeredChannels = new Set(Array.isArray(CFG.jsChannels) ? CFG.jsChannels : []);
+function notifyChannel(channelName, message) {
+  if (!_registeredChannels.has(channelName)) return; // no handler → skip
+  if (window.flutter_inappwebview) {
+    try {
+      window.flutter_inappwebview.callHandler(channelName, message);
+    } catch(e) { log('callHandler error:', channelName, e); }
+  }
+}
+
+// ── FIT CAMERA ────────────────────────────────────────────────────────────────
+function fitCamera(model) {
+  const box    = new THREE.Box3().setFromObject(model);
+  const size   = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z);
+
+  camera.near  = maxDim / 1000;
+  camera.far   = maxDim * 1000;
+  camera.updateProjectionMatrix();
+
+  // Aim at the character's mid-body (~55 % of height from feet)
+  const eyeLevel = box.min.y + size.y * 0.55;
+  orbit.target.set(center.x, eyeLevel, center.z);
+
+  // Place camera at the same height, directly in front
+  const dist = maxDim * 1.8;
+  camera.position.set(center.x, eyeLevel, center.z + dist);
+
+  // Constrain zoom – can get close but not inside, and not too far away
+  orbit.minDistance = maxDim * 0.4;
+  orbit.maxDistance = maxDim * 3.5;
+
+  // Prevent camera going underground
+  orbit.maxPolarAngle = Math.PI * 0.88;
+
+  // Apply camera-orbit if specified (theta phi radius)
+  if (CFG.cameraOrbit) {
+    applyCameraOrbit(CFG.cameraOrbit, center, maxDim);
+  }
+  // Apply camera-target if specified
+  if (CFG.cameraTarget) {
+    applyCameraTarget(CFG.cameraTarget, box);
+  }
+
+  orbit.update();
+
+  // Place shadow plane and grid at model base
+  shadowPlane.position.copy(center);
+  shadowPlane.position.y = box.min.y;
+  grid.scale.setScalar(maxDim);
+  grid.position.y = box.min.y;
+
+  // Adjust key light shadow camera (only meaningful when shadows are enabled)
+  if (_shadowIntensity > 0) {
+    const s = maxDim * 1.5;
+    key.shadow.camera.left   = -s; key.shadow.camera.right = s;
+    key.shadow.camera.top    =  s; key.shadow.camera.bottom= -s;
+    key.shadow.camera.far    = maxDim * 10;
+    key.shadow.camera.updateProjectionMatrix();
+  }
+  key.position.set(maxDim*1.5, maxDim*2, maxDim*1.5);
+  fill.position.set(-maxDim, maxDim*0.5, -maxDim);
+}
+
+function applyCameraOrbit(orbitStr, center, maxDim) {
+  const parts = orbitStr.trim().split(/\s+/);
+  if (parts.length < 2) return;
+  const theta = parseDegree(parts[0], 0);
+  const phi   = parseDegree(parts[1], 75);
+  const radius = parts[2] ? parseFloat(parts[2]) : maxDim * 2;
+  const thetaR = THREE.MathUtils.degToRad(theta);
+  const phiR   = THREE.MathUtils.degToRad(phi);
+  camera.position.set(
+    center.x + radius * Math.sin(phiR) * Math.sin(thetaR),
+    center.y + radius * Math.cos(phiR),
+    center.z + radius * Math.sin(phiR) * Math.cos(thetaR)
+  );
+}
+
+function applyCameraTarget(targetStr, box) {
+  const parts = targetStr.trim().split(/\s+/);
+  const center = box.getCenter(new THREE.Vector3());
+  const size   = box.getSize(new THREE.Vector3());
+  function parseLen(s, def) {
+    if (!s || s === 'auto') return def;
+    if (s.endsWith('mm')) return parseFloat(s) / 1000;
+    if (s.endsWith('cm')) return parseFloat(s) / 100;
+    if (s.endsWith('m'))  return parseFloat(s);
+    return parseFloat(s);
+  }
+  const x = parts[0] === 'auto' ? center.x : parseLen(parts[0], center.x);
+  const y = parts[1] === 'auto' ? center.y : parseLen(parts[1], center.y);
+  const z = parts[2] === 'auto' ? center.z : parseLen(parts[2], center.z);
+  orbit.target.set(x, y, z);
+}
+
+// ── LOAD MODEL ────────────────────────────────────────────────────────────────
+new GLTFLoader().load(
+  '/model',
+  (gltf) => {
+    const model = gltf.scene;
+    model.traverse(o => {
+      if (o.isMesh) {
+        o.castShadow    = _shadowIntensity > 0;
+        o.receiveShadow = _shadowIntensity > 0;
+      }
+    });
+
+    // Apply orientation (Euler angles: roll, pitch, yaw / ZXY order)
+    if (CFG.orientation) {
+      const parts = CFG.orientation.trim().split(/\s+/);
+      if (parts.length >= 3) {
+        model.rotation.set(
+          parseDegree(parts[1], 0) * Math.PI/180,
+          parseDegree(parts[2], 0) * Math.PI/180,
+          parseDegree(parts[0], 0) * Math.PI/180,
+          'ZXY'
+        );
+      }
+    }
+
+    // Apply scale
+    if (CFG.scale) {
+      const parts = CFG.scale.trim().split(/\s+/);
+      if (parts.length === 3) {
+        model.scale.set(parseFloat(parts[0]), parseFloat(parts[1]), parseFloat(parts[2]));
+      } else if (parts.length === 1) {
+        const s = parseFloat(parts[0]);
+        model.scale.set(s, s, s);
+      }
+    }
+
+    scene.add(model);
+    fitCamera(model);
+
+    // Apply material view if requested in config
+    if (_materialViewActive) setMaterialView(true);
+
+    loadingEl.style.display = 'none';
+    notifyChannel('onLoad', 'loaded');
+
+    if (!gltf.animations.length) {
+      notifyChannel('onReady', JSON.stringify({ animations: [], current: null }));
+      runRelatedJs();
+      return;
+    }
+
+    // ── SETUP MIXER ───────────────────────────────────────────────────────────
+    mixer = new THREE.AnimationMixer(model);
+    mixer.timeScale = 1;
+
+    gltf.animations.forEach(clip => {
+      const a = mixer.clipAction(clip);
+      a.enabled = false;
+      a.setEffectiveWeight(0);
+      allActions[clip.name] = a;
+    });
+
+    const names     = Object.keys(allActions);
+    const realClips = names.filter(n => !isRestPose(allActions[n].getClip()));
+
+    if (CFG.animationName && allActions[CFG.animationName]) {
+      idleName = CFG.animationName;
+    } else {
+      idleName = realClips.find(n => /idle/i.test(n)) || realClips[0] || names[0];
+    }
+
+    const shouldPlay = CFG.autoPlay === true || CFG.autoPlay === 'true';
+    if (shouldPlay || idleName) {
+      activeAction = allActions[idleName];
+      activateAction(activeAction, true);
+      activeAction.setEffectiveWeight(1);
+      currentName     = idleName;
+      returningToIdle = true;
+    }
+
+    // Notify Flutter that the model + animations are ready
+    notifyChannel('onReady', JSON.stringify({
+      animations: names,
+      current: idleName,
+    }));
+
+    // 'finished' event
+    mixer.addEventListener('finished', (e) => {
+      if (e.action !== activeAction) return;
+      if (currentName === idleName)  return;
+      if (returningToIdle)           return;
+
+      if (afterMode === 'idle') {
+        if (_queue.length > 0) {
+          window.fadeToAction(_queue.shift());
+        } else {
+          returningToIdle = true;
+          window.fadeToAction(idleName);
+        }
+      }
+      // 'loop' → LoopRepeat handles it; 'hold' → clampWhenFinished freezes last frame
+    });
+
+    runRelatedJs();
+  },
+  (progress) => {
+    if (progress.total) {
+      loadingTxt.textContent = `Loading… ${((progress.loaded/progress.total)*100).toFixed(0)}%`;
+    }
+  },
+  (err) => {
+    loadingEl.style.display = 'none';
+    log('Model load error:', err);
+    notifyChannel('onError', String(err));
+  }
+);
+
+function isRestPose(clip) {
+  return clip.duration < 0.1 || /base.*body|bind|t[\-_]?pose|a[\-_]?pose/i.test(clip.name);
+}
+
+// ── BLEND UPDATE ──────────────────────────────────────────────────────────────
+function updateBlend(delta) {
+  if (!isBlending) return;
+  blendElapsed += delta;
+  const t     = Math.min(blendElapsed / blendDur, 1);
+  const eased = easeInOut(t);
+
+  if (fromAction)   fromAction.setEffectiveWeight(1 - eased);
+  if (activeAction) activeAction.setEffectiveWeight(eased);
+
+  if (t >= 1) {
+    if (fromAction) {
+      fromAction.setEffectiveWeight(0);
+      fromAction.enabled = false;
+      fromAction.paused  = false;
+    }
+    activeAction.setEffectiveWeight(1);
+    isBlending = false;
+    fromAction = null;
+  }
+}
+
+// ── AUTO-ROTATE ───────────────────────────────────────────────────────────────
+orbit.addEventListener('start', () => {
+  userInteracting = true;
+  userInteractTimer = 0;
+});
+orbit.addEventListener('end', () => {
+  userInteracting = false;
+  userInteractTimer = 0;
+});
+
+function updateAutoRotate(delta) {
+  if (!autoRotating) return;
+
+  if (userInteracting) {
+    userInteractTimer = 0;
+    return;
+  }
+
+  userInteractTimer += delta;
+  if (userInteractTimer < autoRotateDelaySec) return;
+
+  // Rotate camera around Y-axis
+  const angle = autoRotateSpeed * delta;
+  const pos   = camera.position.clone().sub(orbit.target);
+  const cos   = Math.cos(angle);
+  const sin   = Math.sin(angle);
+  const x  = cos * pos.x + sin * pos.z;
+  const z  = -sin * pos.x + cos * pos.z;
+  camera.position.set(x + orbit.target.x, pos.y + orbit.target.y, z + orbit.target.z);
+  camera.lookAt(orbit.target);
+  orbit.update();
+}
+
+// ── KEYBOARD ──────────────────────────────────────────────────────────────────
+window.addEventListener('keydown', e => {
+  const names = Object.keys(allActions);
+  const num   = parseInt(e.key);
+  if (!isNaN(num) && num >= 1 && num <= names.length) window.fadeToAction(names[num - 1]);
+  // 'r' toggle auto-rotate
+  if (e.key === 'r' || e.key === 'R') { autoRotating = !autoRotating; }
+  // 'g' toggle grid
+  if (e.key === 'g' || e.key === 'G') { grid.visible = !grid.visible; }
+});
+
+// ── RESIZE ────────────────────────────────────────────────────────────────────
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ── RELATED JS ────────────────────────────────────────────────────────────────
+// Provides a <model-viewer> compatibility shim so that relatedJs written for
+// the original model-viewer web component will work without modification.
+// document.querySelector('model-viewer') returns a thin EventTarget-based
+// shim; after the script runs we dispatch 'load' on it (model already loaded).
+function runRelatedJs() {
+  const js = CFG.relatedJs;
+  if (!js) return;
+  try {
+    // ── model-viewer compat shim ──────────────────────────────────────────────
+    // Create a real DOM element so addEventListener / dispatchEvent work.
+    if (!window._mvShim) {
+      const shim = document.createElement('div');
+      shim.setAttribute('data-mv-compat', 'true');
+      // Mirror common model-viewer properties/methods onto the shim
+      Object.defineProperties(shim, {
+        src:              { get: () => CFG.src,       set: () => {} },
+        autoRotate:       { get: () => !!CFG.autoRotate, set: (v) => { autoRotating = !!v; } },
+        cameraOrbit:      { get: () => CFG.cameraOrbit || 'auto', set: () => {} },
+        animationName:    { get: () => currentName,  set: (n) => window.fadeToAction(n) },
+        availableAnimations: { get: () => Object.keys(allActions) },
+        paused:           { get: () => false },
+        play:             { value: () => window.fadeToAction(currentName || idleName) },
+        pause:            { value: () => { if (activeAction) activeAction.paused = true; } },
+      });
+      document.body.appendChild(shim);
+      window._mvShim = shim;
+    }
+
+    // Patch document.querySelector so 'model-viewer' queries hit the shim
+    const _origQS  = document.querySelector.bind(document);
+    const _origQSA = document.querySelectorAll.bind(document);
+    document.querySelector = function(sel) {
+      if (/^model-?viewer$/i.test(sel) || sel === `#${CFG.id || ''}`) return window._mvShim;
+      return _origQS(sel);
+    };
+    document.querySelectorAll = function(sel) {
+      if (/^model-?viewer$/i.test(sel)) return [window._mvShim];
+      return _origQSA(sel);
+    };
+
+    // Expose Three.js handles for power-users
+    window.MVScene    = scene;
+    window.MVCamera   = camera;
+    window.MVRenderer = renderer;
+    window.MVOrbit    = orbit;
+    window.MVMixer    = mixer;
+    window.MVActions  = allActions;
+
+    eval(js); // eslint-disable-line no-eval
+
+    // Restore querySelector after eval so rest of page is unaffected
+    document.querySelector    = _origQS;
+    document.querySelectorAll = _origQSA;
+
+    // Model is already loaded at this point — fire 'load' so listeners
+    // registered inside relatedJs receive the event.
+    window._mvShim.dispatchEvent(new Event('load'));
+
+  } catch(e) { log('relatedJs error:', e); }
+}
+
+// ── PUBLIC API (callable from Flutter via evaluateJavascript) ─────────────────
+// ── ANIMATION QUEUE ──────────────────────────────────────────────────────────
+// A sequence of clip names to play one-after-another before returning to idle.
+let _queue = [];
+
+window.MVApi = {
+  playAnimation:     (name) => window.fadeToAction(name),
+  // Set which clip is treated as the idle / default state
+  setIdleAnimation:  (name) => {
+    if (!allActions[name]) { log('setIdleAnimation: unknown', name); return; }
+    idleName = name;
+  },
+  // 'loop' | 'idle' | 'hold'
+  setAfterFinishMode: (mode) => { if (window.setMode) window.setMode(mode); },
+  // Play a list of clip names in order, then return to idle
+  playSequence: (names) => {
+    if (!Array.isArray(names) || names.length === 0) return;
+    _queue = [...names];
+    const first = _queue.shift();
+    window.fadeToAction(first);
+  },
+  setAutoRotate:     (v)    => { autoRotating = !!v; },
+  setExposure:       (v)    => { renderer.toneMappingExposure = parseFloat(v); },
+  setShadowIntensity:(v)    => { if (shadowPlaneMat.isMaterial) shadowPlaneMat.opacity = parseFloat(v); },
+  setBackground: (color) => {
+    if (color === 'transparent' || color === '') {
+      scene.background = null; renderer.setClearColor(0x000000, 0);
+    } else {
+      const c = new THREE.Color(color);
+      scene.background = c; renderer.setClearColor(c, 1);
+    }
+  },
+  setMaterialView:   (v)    => setMaterialView(!!v),
+  setBlendDuration:  (v)    => { blendDur = parseFloat(v); },
+  setAnimationSpeed: (v)    => { if (mixer) mixer.timeScale = parseFloat(v); },
+  getAnimationNames:     () => JSON.stringify(Object.keys(allActions)),
+  getCurrentAnimation:   () => currentName,
+  getIdleAnimation:      () => idleName,
+  getAfterFinishMode:    () => afterMode,
+  isMaterialView:        () => _materialViewActive,
+  showGrid: (v)  => { grid.visible = !!v; },
+  resetCamera: () => {
+    const m = scene.children.find(c => c.isGroup || (c.isObject3D && !(c instanceof THREE.Light) && c !== shadowPlane && c !== grid));
+    if (m) fitCamera(m);
+  },
+};
+
+// ── ANIMATE ───────────────────────────────────────────────────────────────────
+let _renderErrorCount = 0;
+function animate() {
+  requestAnimationFrame(animate);
+  try {
+    const delta = clock.getDelta();
+    if (mixer) mixer.update(delta);
+    updateBlend(delta);
+    updateAutoRotate(delta);
+    if (!autoRotating || userInteracting) orbit.update();
+    renderer.render(scene, camera);
+    _renderErrorCount = 0; // reset on success
+  } catch (e) {
+    _renderErrorCount++;
+    console.error('[MV render error #' + _renderErrorCount + ']', e);
+    notifyChannel('onError', String(e));
+    if (_renderErrorCount >= 5) {
+      console.error('[MV] Too many render errors — stopping loop.');
+      return; // stop the RAF loop
+    }
+  }
+}
+animate();
+</script>
+
+<!-- related-js -->
+</body>
+</html>
